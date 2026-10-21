@@ -3,6 +3,7 @@ import threading
 import time
 import numpy as np
 import cv2 as cv
+import tensorflow as tf
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -10,12 +11,17 @@ from mediapipe.tasks.python import vision
 # Ruta al modelo relativa a este archivo (funciona sin importar desde donde se ejecute)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, '..', 'models', 'hand_landmarker.task')
+MODEL_DIR_ENTRENADO = os.path.join(BASE_DIR, '..', 'models', 'mlp_lsch.keras')
 
-BaseOptions = mp.tasks.BaseOptions
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-HandLandmarkerResult = mp.tasks.vision.HandLandmarkerResult
-VisionRunningMode = mp.tasks.vision.RunningMode
+# Etiquetas del modelo entrenado (24 letras estaticas LSCh, excluyendo J y Z)
+LABELS = list('ABCDEFGHIKLMNOPQRSTUVWXY')
+modelo_lsch = tf.keras.models.load_model(MODEL_DIR_ENTRENADO)
+
+BaseOptions = python.BaseOptions
+HandLandmarker = vision.HandLandmarker
+HandLandmarkerOptions = vision.HandLandmarkerOptions
+HandLandmarkerResult = vision.HandLandmarkerResult
+VisionRunningMode = vision.RunningMode
 
 
 def corrected_label(raw_label):
@@ -122,6 +128,18 @@ def draw_coords_panel(frame, hands):
     return frame
 
 
+def normalizacion(hands):
+    if not hands:
+        return []
+    norm_hands = []
+    for hand in hands:
+        coords = hand['coords'] - hand['coords'][0]
+        absmax = np.max(np.abs(coords))
+        if absmax > 0:
+            coords = coords / absmax
+        norm_hands.append({'label': hand['label'], 'coords': coords})
+    return norm_hands
+
 options = HandLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=MODEL_DIR),
     running_mode=VisionRunningMode.LIVE_STREAM,
@@ -155,10 +173,18 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
         with result_lock:
             result = latest_result
-        hands = get_hand_data(result)   # datos x, y, z de cada nodo  #falta normalizar
-        print(f"{hands}\n")
-        draw_hand_graph(frame, hands)
-        draw_coords_panel(frame, hands)
+        hands = get_hand_data(result)   # datos x, y, z de cada nodo
+        if not hands:
+                data = 0
+        else:
+            data = hands
+            data = normalizacion(hands)
+            draw_hand_graph(frame,hands)
+            draw_coords_panel(frame, data)
+            data = data[0]['coords'].flatten()
+            prediccion = modelo_lsch(np.expand_dims(data, axis=0), training=False).numpy()[0]
+            letra_predicha = LABELS[np.argmax(prediccion)]
+            print(f"Letra predicha: {letra_predicha}")
 
         cv.imshow('frame', frame)
         if cv.waitKey(1) == ord('q'):
