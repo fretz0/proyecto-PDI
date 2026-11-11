@@ -1,6 +1,6 @@
 # Reconocimiento de Lengua de Señas Chilena (LSCh) - PDI
 
-Sistema de visión por computador para la detección de manos, extracción y normalización de coordenadas de landmarks, y clasificación en tiempo real de señas estáticas del alfabeto de la Lengua de Señas Chilena (LSCh).
+Sistema de visión por computador para el reconocimiento en tiempo real de la Lengua de Señas Chilena (LSCh), con soporte tanto para el **alfabeto completo (incluyendo letras con movimiento)** como para **palabras y expresiones cotidianas**.
 
 ## Video de demostración
 
@@ -11,15 +11,18 @@ Sistema de visión por computador para la detección de manos, extracción y nor
 ```text
 .
 ├── data/
-│   ├── Senas de LSCh.v5i.tensorflow/     # Imágenes y anotaciones del dataset (train, valid, test)
-│   └── lsch_coordenadas_estaticas.csv    # Coordenadas normalizadas generadas (63 features + label + split)
+│   ├── Senas de LSCh.v5i.tensorflow/     # Imágenes y anotaciones del dataset estático (train, valid, test)
+│   └── lsch_coordenadas_estaticas.csv    # Coordenadas normalizadas estáticas (63 features + label + split)
 ├── models/
+│   ├── gru_lsch_dinamico.h5              # Modelo GRU secuencial para reconocimiento dinámico (50 clases LSCh)
+│   ├── holistic_landmarker.task          # Modelo oficial Holistic Landmarker de MediaPipe (cuerpo + 2 manos)
 │   ├── hand_landmarker.task              # Archivo de modelo Hand Landmarker de MediaPipe
-│   └── mlp_lsch.keras                    # Modelo MLP entrenado para clasificación de señas LSCh
+│   └── mlp_lsch.keras                    # Modelo MLP entrenado para clasificación de letras estáticas
 ├── notebooks/
-│   └── Preprocesamiento_Entrenamiento.ipynb # Pipeline de extracción, normalización, entrenamiento y evaluación
+│   └── Preprocesamiento_Entrenamiento.ipynb # Pipeline de extracción estática, entrenamiento MLP y evaluación
 ├── src/
-│   └── main.py                           # Captura en tiempo real, extracción de landmarks y clasificación con MLP
+│   ├── main.py                           # Reconocimiento dinámico en tiempo real (50 clases: letras + palabras)
+│   └── main_estatico.py                  # Reconocimiento estático original (24 letras con MLP)
 └── README.md
 ```
 
@@ -58,46 +61,63 @@ Sistema de visión por computador para la detección de manos, extracción y nor
    pip install opencv-python mediapipe numpy pandas tensorflow matplotlib scikit-learn
    ```
 
-4. Verificar los modelos en la carpeta `models/`:
-   - `models/hand_landmarker.task`: Modelo de MediaPipe Solutions para detección de landmarks de manos. Si no existe, debe descargarse desde la documentación oficial de MediaPipe.
-   - `models/mlp_lsch.keras`: Modelo MLP entrenado para clasificación de letras. Si no está presente, se genera ejecutando el notebook de entrenamiento.
+4. Modelos en la carpeta `models/`:
+   - `models/gru_lsch_dinamico.h5`: Red neuronal recurrente (GRU) entrenada para 50 clases temporales (abecedario completo y expresiones de LSCh).
+   - `models/holistic_landmarker.task`: Detector oficial de MediaPipe Tasks para postura y ambas manos simultáneas.
+   - `models/mlp_lsch.keras`: Red neuronal densa (MLP) para las 24 letras estáticas.
+   - `models/hand_landmarker.task`: Detector de landmarks de una sola mano para el modo estático.
+
+---
 
 ## Uso y ejecución
 
-### 1. Inferencia y visualización en tiempo real (`src/main.py`)
+### 1. Reconocimiento Dinámico en tiempo real (`src/main.py`) — **Recomendado**
 
-Inicia la cámara web y detecta los 21 landmarks de la mano con MediaPipe. Dibuja el grafo esquelético sobre el video, despliega un panel lateral con las coordenadas numéricas normalizadas y clasifica la postura manual en tiempo real con el modelo MLP (`models/mlp_lsch.keras`), imprimiendo la letra predicha en consola (24 clases estáticas, de la A a la Y excluyendo J y Z).
+Utiliza MediaPipe Holistic (postura y ambas manos) extrayendo un vector de 258 características por frame a través de una ventana deslizante de 30 frames ($\approx$ 1 segundo). Permite reconocer **tanto señas estáticas como señas con movimiento** y construir oraciones de señas en vivo:
 
 ```bash
 python src/main.py
 ```
 
-- **Configuración de cámara**: Por defecto, `main.py` utiliza `cv.VideoCapture(1)`. Si la cámara principal no abre o se usa la integrada de una laptop, editar la línea 153 en `src/main.py` cambiando el índice a `0`:
-  ```python
-  cap = cv.VideoCapture(0)
-  ```
-- **Salir**: Presionar la tecla `q` en la ventana de video para finalizar la ejecución.
+Opciones disponibles por línea de comandos:
+```bash
+python src/main.py --camera 0        # Forzar índice de cámara (ej. 0 para cámara integrada)
+python src/main.py --threshold 0.80  # Ajustar umbral de confianza mínimo (por defecto 0.75)
+```
 
-### 2. Preprocesamiento, entrenamiento y evaluación (`notebooks/Preprocesamiento_Entrenamiento.ipynb`)
+#### Controles en vivo:
+- **`q`**: Salir del programa.
+- **`c`**: Limpiar el historial de señas reconocidas.
 
-El notebook contiene el flujo de trabajo sobre el dataset estático de señas:
+#### Clases reconocidas (50 clases):
+| Categoría | Clases Soportadas |
+|---|---|
+| **Alfabeto Completo (27)** | `A`, `B`, `C`, `D`, `E`, `F`, `H`, `I`, `K`, `L`, `M`, `N`, `O`, `P`, `R`, `T`, `U`, `V`, `W`, `Y`, `Q` y las dinámicas con movimiento: **`G`**, **`J`**, **`Ñ`**, **`S`**, **`X`**, **`Z`**. |
+| **Palabras y Expresiones (22)** | **`Hola`**, **`Chao`**, **`Ayudar`**, **`Disculpar`** (disculpa / por favor), **`Comer`**, **`Caminar`**, **`Flaco`**, **`Alto`**, **`Bajo`**, **`Bonito`**, **`Hablar`**, **`Abrir`**, **`Vender`**, **`Dibujar`**, **`Planchar`**, **`Amigo`**, **`Responsable`**, **`Arrendar`**, **`Chocar`**, **`Vestir`**, **`Estudiar`**, **`Jugar`**. |
+| **Estado Neutro (1)** | **`NONE`** (reposo / ausencia de gesto, evitando falsos positivos continuos). |
 
-1. **Lectura de anotaciones**: Carga las imágenes y bounding boxes desde `data/Senas de LSCh.v5i.tensorflow/`.
-2. **Filtrado**: Excluye letras que requieren movimiento dinámico (`J` y `Z`).
-3. **Extracción y normalización**:
-   - Pasa cada muestra por el detector `HandLandmarker`. Si la detección directa falla, realiza un recorte con margen de 20 píxeles sobre el bounding box anotado.
-   - Centra las coordenadas restando la posición de la muñeca `(0, 0, 0)` y escala dividiendo por el valor absoluto máximo de las coordenadas.
-4. **Exportación tabular**: Guarda la matriz normalizada de 65 columnas (63 correspondientes a los 21 nodos × 3 ejes, más etiqueta y split) en `data/lsch_coordenadas_estaticas.csv`.
-5. **Entrenamiento del clasificador (MLP)**:
-   - Configura una red neuronal secuencial con capas densas (128 y 64 neuronas con activación ReLU, regularización por Dropout de 0.3 y 0.2) y capa de salida de 24 neuronas con Softmax.
-   - Aplica ponderación de clases (`compute_class_weight`) para mitigar el desbalance en el dataset.
-   - Entrena durante 80 épocas con optimizador Adam y pérdida `sparse_categorical_crossentropy`.
-6. **Evaluación y exportación**:
-   - Evalúa el rendimiento sobre el subconjunto de prueba (`test`).
-   - Genera la matriz de confusión con `ConfusionMatrixDisplay` para analizar clasificaciones erróneas entre señas con configuraciones de mano similares (por ejemplo, M y N).
-   - Guarda el modelo resultante en `models/mlp_lsch.keras`.
+---
 
-Para ejecutarlo:
+### 2. Reconocimiento Estático Tradicional (`src/main_estatico.py`)
+
+Inicia el detector de una sola mano con `HandLandmarker` y clasifica postura manual cuadro a cuadro con el modelo MLP (`models/mlp_lsch.keras`), desplegando el grafo esquelético y el panel de coordenadas numéricas normalizadas (24 clases estáticas, excluyendo señas dinámicas).
+
+```bash
+python src/main_estatico.py
+```
+
+---
+
+### 3. Pipeline de Entrenamiento Estático (`notebooks/Preprocesamiento_Entrenamiento.ipynb`)
+
+Contiene el flujo de extracción y entrenamiento del clasificador MLP sobre el dataset de Roboflow (`Senas de LSCh.v5i.tensorflow`):
+1. **Lectura y recorte**: Carga imágenes y bounding boxes con margen de 20 píxeles.
+2. **Normalización**: Centrado en muñeca $(0, 0, 0)$ y escalado por valor absoluto máximo.
+3. **Exportación**: Almacena `data/lsch_coordenadas_estaticas.csv` (63 coordenadas normalizadas).
+4. **Entrenamiento MLP**: Capas densas (128 y 64 con Dropout) entrenadas por 80 épocas con ponderación de clases (`compute_class_weight`).
+5. **Evaluación**: Matriz de confusión y guardado en `models/mlp_lsch.keras`.
+
+Para abrir el notebook:
 ```bash
 jupyter notebook notebooks/Preprocesamiento_Entrenamiento.ipynb
 ```

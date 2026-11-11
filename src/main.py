@@ -1,194 +1,311 @@
+import argparse
+import collections
 import os
-import threading
 import time
-import numpy as np
+
+# Suprimir logs ruidosos de TensorFlow/CUDA para ejecución limpia en CPU
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+
 import cv2 as cv
-import tensorflow as tf
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+import numpy as np
+import tensorflow as tf
 
-# Ruta al modelo relativa a este archivo (funciona sin importar desde donde se ejecute)
+# Rutas del proyecto
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, '..', 'models', 'hand_landmarker.task')
-MODEL_DIR_ENTRENADO = os.path.join(BASE_DIR, '..', 'models', 'mlp_lsch.keras')
+MODEL_PATH = os.path.join(BASE_DIR, '..', 'models', 'gru_lsch_dinamico.h5')
+HOLISTIC_TASK_PATH = os.path.join(BASE_DIR, '..', 'models', 'holistic_landmarker.task')
 
-# Etiquetas del modelo entrenado (24 letras estaticas LSCh, excluyendo J y Z)
-LABELS = list('ABCDEFGHIKLMNOPQRSTUVWXY')
-modelo_lsch = tf.keras.models.load_model(MODEL_DIR_ENTRENADO)
+# 50 Clases del modelo dinámico de Lengua de Señas Chilena (LSCh)
+ACTIONS = np.array([
+    'NONE',
+    # Alfabeto LSCh (incluye letras dinámicas G, J, Ñ, S, X, Z)
+    'A', 'B', 'C', 'D', 'E', 'F', 'H', 'I', 'K', 'L', 'M',
+    'N', 'O', 'P', 'R', 'T', 'U', 'V', 'W', 'Y', 'Q',
+    'G', 'J', 'Ñ', 'S', 'X', 'Z',
+    # Palabras y expresiones cotidianas LSCh
+    'Hola', 'Chao', 'Comer', 'Caminar', 'Flaco', 'Alto', 'Bajo',
+    'Bonito', 'Hablar', 'Ayudar', 'Abrir', 'Disculpar', 'Vender',
+    'Dibujar', 'Planchar', 'Amigo', 'Responsable', 'Arrendar',
+    'Chocar', 'Vestir', 'Estudiar', 'Jugar'
+])
 
-BaseOptions = python.BaseOptions
-HandLandmarker = vision.HandLandmarker
-HandLandmarkerOptions = vision.HandLandmarkerOptions
-HandLandmarkerResult = vision.HandLandmarkerResult
-VisionRunningMode = vision.RunningMode
+SEQUENCE_LENGTH = 30  # 30 frames temporales (~1 segundo)
+NUM_FEATURES = 258     # Pose (132) + Mano Izq (63) + Mano Der (63)
 
-
-def corrected_label(raw_label):
-    """El frame se voltea con cv.flip (espejo), lo que invierte la lateralidad
-    que reporta MediaPipe; por eso se intercambian las etiquetas."""
-    return {'Left': 'Right', 'Right': 'Left'}.get(raw_label, raw_label)
-
-
-#grafo
+# Conexiones anatómicas para graficar sobre el frame con OpenCV
 HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),          # pulgar
-    (0, 5), (5, 6), (6, 7), (7, 8),          # indice
-    (5, 9), (9, 10), (10, 11), (11, 12),     # medio
-    (9, 13), (13, 14), (14, 15), (15, 16),   # anular
-    (13, 17), (17, 18), (18, 19), (19, 20),  # menique
-    (0, 17),                                 # palma
+    (0, 1), (1, 2), (2, 3), (3, 4),          # Pulgar
+    (0, 5), (5, 6), (6, 7), (7, 8),          # Índice
+    (5, 9), (9, 10), (10, 11), (11, 12),     # Medio
+    (9, 13), (13, 14), (14, 15), (15, 16),   # Anular
+    (13, 17), (17, 18), (18, 19), (19, 20),  # Meñique
+    (0, 17)                                  # Palma
 ]
 
-# El callback se ejecuta en otro hilo: guardamos el ultimo resultado con un lock
-latest_result = None
-result_lock = threading.Lock()
-
-
-def save_result(result: HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int):
-    global latest_result
-    with result_lock:
-        latest_result = result
-
-
-LANDMARK_NAMES = [
-    'muneca',
-    'pulgar_cmc', 'pulgar_mcp', 'pulgar_ip', 'pulgar_tip',
-    'indice_mcp', 'indice_pip', 'indice_dip', 'indice_tip',
-    'medio_mcp', 'medio_pip', 'medio_dip', 'medio_tip',
-    'anular_mcp', 'anular_pip', 'anular_dip', 'anular_tip',
-    'menique_mcp', 'menique_pip', 'menique_dip', 'menique_tip',
+POSE_CONNECTIONS = [
+    (11, 12),           # Hombros
+    (11, 13), (13, 15), # Brazo izquierdo
+    (12, 14), (14, 16)  # Brazo derecho
 ]
 
 
-def get_hand_data(result):
-    """Extrae los datos posicionales del grafo de la mano detectada.
+def load_dynamic_model(model_path):
+    """Carga el modelo GRU con compatibilidad garantizada para Keras 2 y Keras 3."""
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"No se encontró el modelo en: {model_path}")
 
-    Devuelve una lista de dicts:
-        {'label': 'Right'|'Left'|None, 'coords': np.ndarray de forma (21, 3)}
-    donde cada fila es (x, y, z) del nodo i:
-        x, y -> normalizados [0, 1] respecto al ancho/alto de la imagen
-        z    -> profundidad relativa a la muneca (mas negativo = mas cerca de la camara)
+    from tensorflow.keras.layers import Dense, GRU, Input
+    from tensorflow.keras.models import Sequential
+
+    model = Sequential([
+        Input(shape=(SEQUENCE_LENGTH, NUM_FEATURES)),
+        GRU(64, return_sequences=True, activation='tanh'),
+        GRU(64, return_sequences=False, activation='tanh'),
+        Dense(len(ACTIONS), activation='softmax')
+    ])
+    model.load_weights(model_path)
+    print(f"[OK] Modelo dinámico GRU cargado exitosamente desde {model_path}")
+    return model
+
+
+def extract_keypoints(result):
+    """Extrae exactamente 258 características desde HolisticLandmarkerResult:
+
+    - Pose: 33 puntos x 4 (x, y, z, visibilidad) = 132
+    - Mano izquierda: 21 puntos x 3 (x, y, z) = 63
+    - Mano derecha: 21 puntos x 3 (x, y, z) = 63
     """
-    hands = []
-    if result is None or not result.hand_landmarks:
-        return hands
-    for i, hand in enumerate(result.hand_landmarks):
-        label = None
-        if result.handedness and i < len(result.handedness):
-            label = corrected_label(result.handedness[i][0].category_name)
-        coords = np.array([[lm.x, lm.y, lm.z] for lm in hand], dtype=np.float32)
-        hands.append({'label': label, 'coords': coords})
-    return hands
+    if result.pose_landmarks and len(result.pose_landmarks) > 0:
+        pose = np.array([
+            [lm.x, lm.y, lm.z, getattr(lm, 'visibility', 0.0) or 0.0]
+            for lm in result.pose_landmarks
+        ], dtype=np.float32).flatten()
+    else:
+        pose = np.zeros(33 * 4, dtype=np.float32)
+
+    if result.left_hand_landmarks and len(result.left_hand_landmarks) > 0:
+        lh = np.array([
+            [lm.x, lm.y, lm.z]
+            for lm in result.left_hand_landmarks
+        ], dtype=np.float32).flatten()
+    else:
+        lh = np.zeros(21 * 3, dtype=np.float32)
+
+    if result.right_hand_landmarks and len(result.right_hand_landmarks) > 0:
+        rh = np.array([
+            [lm.x, lm.y, lm.z]
+            for lm in result.right_hand_landmarks
+        ], dtype=np.float32).flatten()
+    else:
+        rh = np.zeros(21 * 3, dtype=np.float32)
+
+    return np.concatenate([pose, lh, rh])
 
 
-def draw_hand_graph(frame, hands):
-    """Dibuja los landmarks (nodos) y conexiones (aristas) de cada mano detectada."""
+def draw_landmarks(frame, result):
+    """Dibuja con OpenCV los esqueletos de manos y extremidades superiores."""
     h, w = frame.shape[:2]
-    for hand in hands:
-        # Coordenadas normalizadas [0,1] -> pixeles
-        pts = [(int(x * w), int(y * h)) for x, y, _ in hand['coords']]
-        for a, b in HAND_CONNECTIONS:
-            cv.line(frame, pts[a], pts[b], (0, 255, 0), 2)
-        for idx, p in enumerate(pts):
-            cv.circle(frame, p, 4, (0, 0, 255), -1)
-            # Indice del nodo junto al punto (para relacionarlo con el panel)
-            cv.putText(frame, str(idx), (p[0] + 5, p[1] - 5),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        # Etiqueta de mano (Left/Right)
-        if hand['label'] is not None:
-            cv.putText(frame, hand['label'], (pts[0][0], pts[0][1] + 20),
-                       cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-    return frame
+
+    # Dibujar Pose (Hombros, codos, muñecas)
+    if result.pose_landmarks and len(result.pose_landmarks) > 0:
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in result.pose_landmarks]
+        for a, b in POSE_CONNECTIONS:
+            if a < len(pts) and b < len(pts):
+                cv.line(frame, pts[a], pts[b], (255, 128, 0), 2)
+        for idx in [11, 12, 13, 14, 15, 16]:
+            if idx < len(pts):
+                cv.circle(frame, pts[idx], 4, (0, 165, 255), -1)
+
+    # Dibujar Manos
+    for hand_lms, color_line, color_dot in [
+        (result.left_hand_landmarks, (255, 0, 128), (255, 255, 0)),
+        (result.right_hand_landmarks, (0, 255, 128), (0, 255, 255))
+    ]:
+        if hand_lms and len(hand_lms) > 0:
+            pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lms]
+            for a, b in HAND_CONNECTIONS:
+                if a < len(pts) and b < len(pts):
+                    cv.line(frame, pts[a], pts[b], color_line, 2)
+            for p in pts:
+                cv.circle(frame, p, 3, color_dot, -1)
 
 
-def draw_coords_panel(frame, hands):
-    """Imprime en pantalla las coordenadas (x, y, z) de cada nodo del grafo."""
-    if not hands:
-        return frame
-    line_h = 15
-    font_scale = 0.4
-    panel_w = 230
-    for n, hand in enumerate(hands):
-        x0 = 5 + n * (panel_w + 5)
-        panel_h = line_h * (len(hand['coords']) + 2)
-        # Fondo semitransparente para que el texto sea legible
-        overlay = frame.copy()
-        cv.rectangle(overlay, (x0, 5), (x0 + panel_w, 5 + panel_h), (0, 0, 0), -1)
-        cv.addWeighted(overlay, 0.5, frame, 0.5, 0, dst=frame)
+def draw_ui(frame, current_action, confidence, sentence, fps):
+    """Despliega paneles semitransparentes, barra de confianza e historial."""
+    h, w = frame.shape[:2]
 
-        y = 5 + line_h
-        cv.putText(frame, f"{hand['label']}   x      y      z", (x0 + 5, y),
-                   cv.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 1)
-        for idx, (x, yy, z) in enumerate(hand['coords']):
-            y += line_h
-            text = f"{idx:2d}: {x:6.3f} {yy:6.3f} {z:7.3f}"
-            cv.putText(frame, text, (x0 + 5, y),
-                       cv.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), 1)
-    return frame
+    # Panel superior para predicción en vivo
+    overlay = frame.copy()
+    cv.rectangle(overlay, (0, 0), (w, 75), (20, 20, 20), -1)
+    # Panel inferior para historial de señas
+    cv.rectangle(overlay, (0, h - 50), (w, h), (15, 15, 15), -1)
+    cv.addWeighted(overlay, 0.75, frame, 0.25, 0, dst=frame)
+
+    if current_action == 'NONE':
+        action_text = "Esperando seña..."
+        tag_color = (150, 150, 150)
+    else:
+        action_text = f"Seña: {current_action}"
+        tag_color = (0, 255, 128)
+
+    # Texto de la seña actual
+    cv.putText(frame, action_text, (20, 36),
+               cv.FONT_HERSHEY_SIMPLEX, 0.85, tag_color, 2, cv.LINE_AA)
+
+    # Barra gráfica de confianza
+    bar_x = w - 300
+    bar_w = 200
+    bar_h = 16
+    cv.rectangle(frame, (bar_x, 20), (bar_x + bar_w, 20 + bar_h), (80, 80, 80), 2)
+    fill_w = int(bar_w * max(0.0, min(1.0, float(confidence))))
+    cv.rectangle(frame, (bar_x, 20), (bar_x + fill_w, 20 + bar_h), (0, 220, 0), -1)
+    cv.putText(frame, f"{int(confidence * 100)}%", (bar_x + bar_w + 10, 34),
+               cv.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv.LINE_AA)
+
+    # Estado de FPS y comandos
+    cv.putText(frame, f"FPS: {fps:4.1f} | [q]: Salir  [c]: Limpiar historial", (20, 62),
+               cv.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv.LINE_AA)
+
+    # Historial de señas confirmadas
+    history_str = "Historial: " + " ".join([f"[{s}]" for s in sentence[-8:]])
+    cv.putText(frame, history_str, (20, h - 18),
+               cv.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv.LINE_AA)
 
 
-def normalizacion(hands):
-    if not hands:
-        return []
-    norm_hands = []
-    for hand in hands:
-        coords = hand['coords'] - hand['coords'][0]
-        absmax = np.max(np.abs(coords))
-        if absmax > 0:
-            coords = coords / absmax
-        norm_hands.append({'label': hand['label'], 'coords': coords})
-    return norm_hands
+def open_webcam(preferred_idx=1):
+    """Busca y abre la cámara especificada o la primera disponible."""
+    candidates = [preferred_idx, 0, 2]
+    seen = set()
+    indices = [x for x in candidates if not (x in seen or seen.add(x))]
 
-options = HandLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path=MODEL_DIR),
-    running_mode=VisionRunningMode.LIVE_STREAM,
-    num_hands=1,
-    min_hand_detection_confidence=0.35, # Sensibilidad para encontrar la mano inicialmente
-    min_hand_presence_confidence=0.30,  # Evita que se pierda cuando cambia de ángulo/pose
-    min_tracking_confidence=0.30,       # Mantiene el rastreo en movimientos rápidos
-    result_callback=save_result)  # se pasa la funcion, NO se llama
+    for idx in indices:
+        cap = cv.VideoCapture(idx)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            if ret:
+                print(f"[OK] Cámara web conectada en índice {idx}")
+                return cap, idx
+            cap.release()
+    return None, None
 
-with HandLandmarker.create_from_options(options) as landmarker:
-    cap = cv.VideoCapture(1) # cambiar camara 
-    if not cap.isOpened():
-        print("no se pudo abrir la camara")
-        exit()
 
-    last_ts = -1
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("no se pudo recibir el frame (acabado el streaming?). saliendo")
-            break
-        frame = cv.flip(frame,1)
-        frame2RGB = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame2RGB)
+def main():
+    parser = argparse.ArgumentParser(description="Reconocimiento dinámico de LSCh en tiempo real")
+    parser.add_argument('--camera', type=int, default=1, help="Índice preferido de cámara (default: 1)")
+    parser.add_argument('--threshold', type=float, default=0.75, help="Umbral mínimo de confianza (default: 0.75)")
+    args = parser.parse_args()
 
-        timestamp_ms = int(time.monotonic() * 1000)
-        if timestamp_ms <= last_ts:
-            timestamp_ms = last_ts + 1
-        last_ts = timestamp_ms
-        landmarker.detect_async(mp_image, timestamp_ms)
+    # Cargar modelo clasificador
+    model = load_dynamic_model(MODEL_PATH)
 
-        with result_lock:
-            result = latest_result
-        hands = get_hand_data(result)   # datos x, y, z de cada nodo
-        if not hands:
-                data = 0
-        else:
-            data = hands
-            data = normalizacion(hands)
-            draw_hand_graph(frame,hands)
-            draw_coords_panel(frame, data)
-            data = data[0]['coords'].flatten()
-            prediccion = modelo_lsch(np.expand_dims(data, axis=0), training=False).numpy()[0]
-            letra_predicha = LABELS[np.argmax(prediccion)]
-            print(f"Letra predicha: {letra_predicha}")
+    # Configurar HolisticLandmarker con la API oficial de MediaPipe Tasks
+    if not os.path.exists(HOLISTIC_TASK_PATH):
+        raise FileNotFoundError(f"No se encontró el modelo de MediaPipe en: {HOLISTIC_TASK_PATH}")
 
-        cv.imshow('frame', frame)
-        if cv.waitKey(1) == ord('q'):
-            break
+    base_options = python.BaseOptions(model_asset_path=HOLISTIC_TASK_PATH)
+    options = vision.HolisticLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.IMAGE
+    )
+
+    cap, active_cam = open_webcam(args.camera)
+    if cap is None:
+        print("[ERROR] No se pudo acceder a ninguna cámara disponible.")
+        return
+
+    sequence = collections.deque(maxlen=SEQUENCE_LENGTH)
+    sentence = []
+    current_action = 'NONE'
+    confidence = 0.0
+
+    # Lógica de confirmación (debounce) para el historial
+    confirm_count = 0
+    REQUIRED_CONSECUTIVE_FRAMES = 5
+    last_confirmed_action = 'NONE'
+
+    prev_time = time.time()
+    fps = 0.0
+
+    print("\n" + "=" * 62)
+    print("  RECONOCIMIENTO DINÁMICO LSCh ACTIVO (50 CLASES)")
+    print("  - Alfabeto completo A-Z (incluye dinámicas J, Z, G, S, X, Ñ)")
+    print("  - Expresiones: Hola, Chao, Ayudar, Disculpar, Comer, etc.")
+    print("  - Controles: [q] Salir  |  [c] Limpiar historial")
+    print("=" * 62 + "\n")
+
+    with vision.HolisticLandmarker.create_from_options(options) as landmarker:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                print("[AVISO] Flujo de video finalizado.")
+                break
+
+            # Modo espejo y conversión para MediaPipe
+            frame = cv.flip(frame, 1)
+            frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+
+            # Detección de landmarks con Tasks API
+            result = landmarker.detect(mp_image)
+
+            # Dibujar grafo sobre el frame
+            draw_landmarks(frame, result)
+
+            # Extraer vector de 258 características y guardar en buffer
+            keypoints = extract_keypoints(result)
+            sequence.append(keypoints)
+
+            # Inferencia cuando se han acumulado los 30 frames
+            if len(sequence) == SEQUENCE_LENGTH:
+                input_data = np.expand_dims(list(sequence), axis=0)
+                pred = model(input_data, training=False).numpy()[0]
+                best_idx = np.argmax(pred)
+                pred_action = ACTIONS[best_idx]
+                pred_conf = pred[best_idx]
+
+                if pred_conf >= args.threshold:
+                    current_action = pred_action
+                    confidence = pred_conf
+
+                    # Registrar en historial si la predicción es estable
+                    if current_action == last_confirmed_action:
+                        confirm_count += 1
+                    else:
+                        confirm_count = 1
+                        last_confirmed_action = current_action
+
+                    if confirm_count == REQUIRED_CONSECUTIVE_FRAMES and current_action != 'NONE':
+                        if len(sentence) == 0 or sentence[-1] != current_action:
+                            sentence.append(current_action)
+                            print(f"[RECONOCIDO]: {current_action} ({int(confidence * 100)}%)")
+                else:
+                    current_action = 'NONE'
+                    confidence = pred_conf
+                    confirm_count = 0
+
+            # Cálculo de FPS suavizado
+            curr_time = time.time()
+            fps = 0.9 * fps + 0.1 * (1.0 / max(curr_time - prev_time, 1e-5))
+            prev_time = curr_time
+
+            # Interfaz visual
+            draw_ui(frame, current_action, confidence, sentence, fps)
+
+            cv.imshow('Reconocimiento LSCh Dinamico - TEL-328', frame)
+            key = cv.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('c'):
+                sentence.clear()
+                print("[INFO] Historial limpiado.")
 
     cap.release()
     cv.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()
