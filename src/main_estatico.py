@@ -1,12 +1,45 @@
+import glob
 import os
+import sys
 import threading
 import time
+
+# Auto-configurar rutas de bibliotecas NVIDIA si no están en LD_LIBRARY_PATH
+def _ensure_cuda_libs():
+    site_packages = glob.glob(os.path.join(sys.prefix, 'lib', 'python*', 'site-packages', 'nvidia', '*', 'lib'))
+    if site_packages and not os.environ.get('_TF_CUDA_ENV_SET'):
+        current_ld = os.environ.get('LD_LIBRARY_PATH', '')
+        missing = [p for p in site_packages if p not in current_ld.split(':')]
+        if missing:
+            env = os.environ.copy()
+            env['LD_LIBRARY_PATH'] = ':'.join(site_packages) + (':' + current_ld if current_ld else '')
+            env['_TF_CUDA_ENV_SET'] = '1'
+            os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+_ensure_cuda_libs()
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import numpy as np
 import cv2 as cv
 import tensorflow as tf
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
+
+# Configuración y verificación de GPU
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        details = tf.config.experimental.get_device_details(gpus[0])
+        gpu_name = details.get('device_name', gpus[0].name)
+        print(f"[GPU ACTIVA] TensorFlow ejecutando en GPU: {gpu_name}")
+    except RuntimeError as e:
+        print(f"[GPU AVISO] {e}")
+else:
+    print("[CPU] No se detectó GPU disponible, ejecutando en CPU.")
 
 # Ruta al modelo relativa a este archivo (funciona sin importar desde donde se ejecute)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -150,7 +183,10 @@ options = HandLandmarkerOptions(
     result_callback=save_result)  # se pasa la funcion, NO se llama
 
 with HandLandmarker.create_from_options(options) as landmarker:
-    cap = cv.VideoCapture(1) # cambiar camara 
+    cap = cv.VideoCapture(1)
+    if not cap.isOpened() or not cap.read()[0]:
+        cap.release()
+        cap = cv.VideoCapture(0)
     if not cap.isOpened():
         print("no se pudo abrir la camara")
         exit()
