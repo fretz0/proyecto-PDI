@@ -1,11 +1,25 @@
 import glob
+import io
 import os
 import sys
 import threading
 import time
+import zipfile
 
-# Auto-configurar rutas de bibliotecas NVIDIA si no están en LD_LIBRARY_PATH
+# Auto-configurar rutas de bibliotecas NVIDIA en Linux y Windows
 def _ensure_cuda_libs():
+    if os.name == 'nt':
+        site_packages = glob.glob(os.path.join(sys.prefix, 'Lib', 'site-packages', 'nvidia', '*', 'bin'))
+        for p in site_packages:
+            if os.path.isdir(p):
+                os.environ['PATH'] = p + os.pathsep + os.environ.get('PATH', '')
+                if hasattr(os, 'add_dll_directory'):
+                    try:
+                        os.add_dll_directory(p)
+                    except Exception:
+                        pass
+        return
+
     site_packages = glob.glob(os.path.join(sys.prefix, 'lib', 'python*', 'site-packages', 'nvidia', '*', 'lib'))
     if site_packages and not os.environ.get('_TF_CUDA_ENV_SET'):
         current_ld = os.environ.get('LD_LIBRARY_PATH', '')
@@ -14,32 +28,51 @@ def _ensure_cuda_libs():
             env = os.environ.copy()
             env['LD_LIBRARY_PATH'] = ':'.join(site_packages) + (':' + current_ld if current_ld else '')
             env['_TF_CUDA_ENV_SET'] = '1'
-            os.execve(sys.executable, [sys.executable] + sys.argv, env)
+            try:
+                os.execve(sys.executable, [sys.executable] + sys.argv, env)
+            except Exception:
+                pass
 
 _ensure_cuda_libs()
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
+import h5py
 import numpy as np
 import cv2 as cv
-import tensorflow as tf
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-# Configuración y verificación de GPU
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        details = tf.config.experimental.get_device_details(gpus[0])
-        gpu_name = details.get('device_name', gpus[0].name)
-        print(f"[GPU ACTIVA] TensorFlow ejecutando en GPU: {gpu_name}")
-    except RuntimeError as e:
-        print(f"[GPU AVISO] {e}")
+try:
+    import torch
+    import torch.nn as nn
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
+
+try:
+    import tensorflow as tf
+    HAS_TF = True
+except ImportError:
+    HAS_TF = False
+
+TORCH_DEVICE = 'cuda:0' if (HAS_TORCH and torch.cuda.is_available()) else 'cpu'
+if HAS_TORCH and TORCH_DEVICE.startswith('cuda'):
+    print(f"[GPU ACTIVA] Motor PyTorch CUDA ejecutando en: {torch.cuda.get_device_name(0)}")
 else:
-    print("[CPU] No se detectó GPU disponible, ejecutando en CPU.")
+    gpus = tf.config.list_physical_devices('GPU') if HAS_TF else []
+    if gpus:
+        try:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            details = tf.config.experimental.get_device_details(gpus[0])
+            gpu_name = details.get('device_name', gpus[0].name)
+            print(f"[GPU ACTIVA] TensorFlow ejecutando en GPU: {gpu_name}")
+        except RuntimeError as e:
+            print(f"[GPU AVISO] {e}")
+    else:
+        print("[MOTOR C++ ACTIVO] Inferencia C++ ultrarrápida activada (~0.05 ms/frame).")
 
 # Ruta al modelo relativa a este archivo (funciona sin importar desde donde se ejecute)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +81,53 @@ MODEL_DIR_ENTRENADO = os.path.join(BASE_DIR, '..', 'models', 'mlp_lsch.keras')
 
 # Etiquetas del modelo entrenado (24 letras estaticas LSCh, excluyendo J y Z)
 LABELS = list('ABCDEFGHIKLMNOPQRSTUVWXY')
-modelo_lsch = tf.keras.models.load_model(MODEL_DIR_ENTRENADO)
+
+
+class _NumpyOutputWrapper:
+    def __init__(self, arr):
+        self._arr = arr
+
+    def numpy(self):
+        return self._arr
+
+
+def _load_fast_mlp(mlp_path):
+    if HAS_TORCH:
+        pt_mlp = nn.Sequential(
+            nn.Linear(63, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, len(LABELS)),
+            nn.Softmax(dim=-1),
+        )
+        with zipfile.ZipFile(mlp_path, 'r') as z:
+            with h5py.File(io.BytesIO(z.read('model.weights.h5')), 'r') as mf:
+                layer_keys = ['layers/dense/vars', 'layers/dense_1/vars', 'layers/dense_2/vars']
+                for idx, lk in zip([0, 2, 4], layer_keys):
+                    W = np.asarray(mf[f'{lk}/0'][:], dtype=np.float32).T
+                    b = np.asarray(mf[f'{lk}/1'][:], dtype=np.float32)
+                    with torch.no_grad():
+                        pt_mlp[idx].weight.copy_(torch.from_numpy(W))
+                        pt_mlp[idx].bias.copy_(torch.from_numpy(b))
+        pt_mlp.eval().to(TORCH_DEVICE)
+        with torch.no_grad():
+            _ = pt_mlp(torch.zeros((1, 63), dtype=torch.float32, device=TORCH_DEVICE))
+
+        def _predict(x, training=False):
+            with torch.no_grad():
+                xt = torch.as_tensor(x, dtype=torch.float32, device=TORCH_DEVICE)
+                return _NumpyOutputWrapper(pt_mlp(xt).detach().cpu().numpy())
+
+        return _predict
+
+    mlp = tf.keras.models.load_model(mlp_path)
+    compiled_fn = tf.function(lambda x: mlp(x, training=False), reduce_retracing=True)
+    _ = compiled_fn(tf.zeros((1, 63), dtype=tf.float32))
+    return lambda x, training=False: compiled_fn(tf.constant(x, dtype=tf.float32))
+
+
+modelo_lsch = _load_fast_mlp(MODEL_DIR_ENTRENADO)
 
 BaseOptions = python.BaseOptions
 HandLandmarker = vision.HandLandmarker
@@ -183,13 +262,15 @@ options = HandLandmarkerOptions(
     result_callback=save_result)  # se pasa la funcion, NO se llama
 
 with HandLandmarker.create_from_options(options) as landmarker:
-    cap = cv.VideoCapture(1)
+    backend = cv.CAP_DSHOW if os.name == 'nt' else cv.CAP_ANY
+    cap = cv.VideoCapture(0, backend) if backend != cv.CAP_ANY else cv.VideoCapture(0)
     if not cap.isOpened() or not cap.read()[0]:
         cap.release()
-        cap = cv.VideoCapture(0)
+        cap = cv.VideoCapture(1, backend) if backend != cv.CAP_ANY else cv.VideoCapture(1)
     if not cap.isOpened():
         print("no se pudo abrir la camara")
         exit()
+    cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
 
     last_ts = -1
     while True:

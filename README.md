@@ -47,7 +47,9 @@ Sistema híbrido de visión por computador y aprendizaje profundo para el recono
 
 ---
 
-## Instalación y Configuración (Linux / Fedora con GPU NVIDIA)
+## Instalación y Configuración (Linux / Windows)
+
+### Linux (Fedora / Ubuntu con GPU NVIDIA)
 
 1. Crear y activar el entorno virtual:
    ```bash
@@ -66,22 +68,49 @@ Sistema híbrido de visión por computador y aprendizaje profundo para el recono
    python verify_gpu.py
    ```
 
+### Windows 10 / 11
+
+TensorFlow 2.11 y versiones posteriores no soportan CUDA de forma nativa en Windows. Para evitar la caída de FPS en modo eager de TensorFlow, el proyecto detecta el sistema operativo y ejecuta los modelos GRU y MLP sobre PyTorch (CUDA si la GPU está activa o motor C++ en CPU) con los mismos pesos entrenados. En Windows también se habilita captura de cámara por DirectShow (`CAP_DSHOW`) y fuentes del sistema (`Segoe UI`, `Arial`, `Calibri`) para el HUD.
+
+1. Crear y activar el entorno virtual (PowerShell):
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
+   *(En CMD: `.venv\Scripts\activate.bat`)*
+
+2. Instalar las dependencias:
+   ```powershell
+   python -m pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
+
+3. Verificar entorno, hardware NVIDIA y latencia de inferencia:
+   ```powershell
+   python verify_gpu.py
+   ```
+
 ---
 
 ## Uso y Ejecución
 
 ### 1. Reconocimiento Continuo en Tiempo Real (`src/main.py`) — **Principal**
 
-Ejecuta el sistema híbrido completo de 50 clases acelerado por GPU:
+Ejecuta el sistema híbrido completo de 50 clases:
 
 ```bash
+# Linux
 .venv/bin/python src/main.py
+
+# Windows
+.venv\Scripts\python src\main.py
 ```
 
 Opciones por línea de comandos:
 ```bash
-.venv/bin/python src/main.py --camera 0        # Seleccionar índice de cámara web (default: 0)
-.venv/bin/python src/main.py --threshold 0.65  # Ajustar umbral mínimo de confirmación (default: 0.65)
+# Linux / Windows (con el entorno activado)
+python src/main.py --camera 0        # Seleccionar índice de cámara web (default: 0)
+python src/main.py --threshold 0.65  # Ajustar umbral mínimo de confirmación (default: 0.65)
 ```
 
 #### Controles interactivos en la ventana HUD:
@@ -105,7 +134,11 @@ Opciones por línea de comandos:
 Modo dedicado exclusivamente a las 24 letras estáticas mediante `HandLandmarker` y la red neuronal densa `models/mlp_lsch.keras`:
 
 ```bash
+# Linux
 .venv/bin/python src/main_estatico.py
+
+# Windows
+.venv\Scripts\python src\main_estatico.py
 ```
 
 ---
@@ -123,5 +156,9 @@ Modo dedicado exclusivamente a las 24 letras estáticas mediante `HandLandmarker
 
 Para abrir los notebooks interactivamente:
 ```bash
+# Linux
 .venv/bin/jupyter notebook notebooks/
+
+# Windows
+.venv\Scripts\jupyter notebook notebooks\
 ```
