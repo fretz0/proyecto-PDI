@@ -47,50 +47,7 @@ Sistema híbrido de visión por computador y aprendizaje profundo para el recono
 
 ---
 
-## Instalación y Configuración (Linux / Windows)
 
-### Linux (Fedora / Ubuntu con GPU NVIDIA)
-
-1. Crear y activar el entorno virtual:
-   ```bash
-   python3.11 -m venv .venv
-   source .venv/bin/activate
-   ```
-
-2. Instalar las dependencias (incluye `tensorflow[and-cuda]` para aceleración por GPU):
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-3. Verificar la detección y aceleración por GPU:
-   ```bash
-   python verify_gpu.py
-   ```
-
-### Windows 10 / 11
-
-TensorFlow 2.11 y versiones posteriores no soportan CUDA de forma nativa en Windows. Para evitar la caída de FPS en modo eager de TensorFlow, el proyecto detecta el sistema operativo y ejecuta los modelos GRU y MLP sobre PyTorch (CUDA si la GPU está activa o motor C++ en CPU) con los mismos pesos entrenados. En Windows también se habilita captura de cámara por DirectShow (`CAP_DSHOW`) y fuentes del sistema (`Segoe UI`, `Arial`, `Calibri`) para el HUD.
-
-1. Crear y activar el entorno virtual (PowerShell):
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-   *(En CMD: `.venv\Scripts\activate.bat`)*
-
-2. Instalar las dependencias:
-   ```powershell
-   python -m pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-3. Verificar entorno, hardware NVIDIA y latencia de inferencia:
-   ```powershell
-   python verify_gpu.py
-   ```
-
----
 
 
 
