@@ -304,17 +304,17 @@ def load_static_mlp(mlp_path):
 class RobustHandTracker:
     """
     Rastreador temporal de manos de alta robustez:
-    - Previene que las manos se confundan entre sí o se pierdan contra el torso.
-    - Respeta incondicionalmente ambas manos cuando Holistic las detecta (no borra manos cuando se tocan).
+    - Evita la superposición de dos grafos sobre una misma mano física (deduplicación por IoU, palma y escala).
+    - Respeta ambas manos cuando son físicamente distintas (incluyendo señas bimanuales de contacto).
     - Asigna candidatos de HandLandmarker por continuidad temporal y conectividad con los brazos (muñecas 15 y 16 de Pose).
-    - Mantiene 'coasting' por oclusión en señas bimanuales de contacto (Chocar, Amigo, Estudiar, Disculpar)
-      para que una mano no desaparezca cuando la otra pasa por delante.
+    - Mantiene 'coasting' por oclusión solo cuando había una seña bimanual genuina activa (Chocar, Amigo, Estudiar, Disculpar).
     """
     def __init__(self):
         self.prev_rh = None  # Lista de landmarks de RH en frame anterior
         self.prev_lh = None  # Lista de landmarks de LH en frame anterior
         self.rh_lost_frames = 0
         self.lh_lost_frames = 0
+        self.both_active_frames = 0
         self.max_occlusion_coasting = 6
 
     def reset(self):
@@ -322,24 +322,113 @@ class RobustHandTracker:
         self.prev_lh = None
         self.rh_lost_frames = 0
         self.lh_lost_frames = 0
+        self.both_active_frames = 0
+
+    @staticmethod
+    def _hand_metrics(hand):
+        xs = np.array([lm.x for lm in hand], dtype=np.float32)
+        ys = np.array([lm.y for lm in hand], dtype=np.float32)
+        bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+        span = float(np.hypot(bbox[2] - bbox[0], bbox[3] - bbox[1]))
+        palm = (float(np.mean(xs[[0, 5, 9, 13, 17]])), float(np.mean(ys[[0, 5, 9, 13, 17]])))
+        wrist = (float(xs[0]), float(ys[0]))
+        return xs, ys, bbox, max(span, 0.06), palm, wrist
+
+    @staticmethod
+    def _bbox_iou(b1, b2):
+        ix0 = max(b1[0], b2[0])
+        iy0 = max(b1[1], b2[1])
+        ix1 = min(b1[2], b2[2])
+        iy1 = min(b1[3], b2[3])
+        inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+        if inter <= 0.0:
+            return 0.0
+        a1 = max(0.0, b1[2] - b1[0]) * max(0.0, b1[3] - b1[1])
+        a2 = max(0.0, b2[2] - b2[0]) * max(0.0, b2[3] - b2[1])
+        denom = a1 + a2 - inter
+        return inter / denom if denom > 1e-6 else 0.0
+
+    @classmethod
+    def _is_same_hand(cls, hand_a, hand_b):
+        """Determina si dos conjuntos de 21 landmarks corresponden a la misma mano física."""
+        if hand_a is None or hand_b is None:
+            return False
+        xa, ya, ba, scale_a, palm_a, wrist_a = cls._hand_metrics(hand_a)
+        xb, yb, bb, scale_b, palm_b, wrist_b = cls._hand_metrics(hand_b)
+        scale = max(scale_a, scale_b)
+
+        mean_dist = float(np.mean(np.hypot(xa - xb, ya - yb)))
+        d_wrist = float(np.hypot(wrist_a[0] - wrist_b[0], wrist_a[1] - wrist_b[1]))
+        d_palm = float(np.hypot(palm_a[0] - palm_b[0], palm_a[1] - palm_b[1]))
+        iou = cls._bbox_iou(ba, bb)
+
+        # 1. Landmarks casi idénticos (absoluto o relativo al tamaño de la mano en cámara)
+        if mean_dist < 0.06 or (mean_dist / scale) < 0.35:
+            return True
+
+        # 2. Misma caja envolvente (IoU alto) y palma/muñeca superpuestas
+        #    (cubre desalineaciones entre HolisticLandmarker y HandLandmarker sobre la misma mano)
+        if iou > 0.45 and (d_palm / scale) < 0.35 and (d_wrist / scale) < 0.45:
+            return True
+
+        # 3. Muñeca y palma prácticamente en el mismo punto (p.ej. detección espejada/rotada sobre la misma mano)
+        if (d_wrist / scale) < 0.25 and (d_palm / scale) < 0.28:
+            return True
+
+        return False
+
+    def _hand_side_cost(self, hand, side, pose_lms):
+        """Calcula el costo de asociar una mano al lado derecho ('rh') o izquierdo ('lh')."""
+        cw = (hand[0].x, hand[0].y)
+        if side == 'rh':
+            pose_idx = 16
+            default_pt = (0.35, 0.70)
+            prev_hand = self.prev_rh
+            lost_frames = self.rh_lost_frames
+        else:
+            pose_idx = 15
+            default_pt = (0.65, 0.70)
+            prev_hand = self.prev_lh
+            lost_frames = self.lh_lost_frames
+
+        if pose_lms and len(pose_lms) > pose_idx:
+            vis = float(getattr(pose_lms[pose_idx], 'visibility', 1.0) or 0.0)
+            d_pose = float(np.hypot(cw[0] - pose_lms[pose_idx].x, cw[1] - pose_lms[pose_idx].y))
+            if vis < 0.35:
+                d_pose += 0.25
+        else:
+            d_pose = float(np.hypot(cw[0] - default_pt[0], cw[1] - default_pt[1]))
+
+        if prev_hand is not None and lost_frames <= self.max_occlusion_coasting:
+            d_prev = float(np.hypot(cw[0] - prev_hand[0].x, cw[1] - prev_hand[0].y))
+            return 0.45 * d_pose + 0.55 * d_prev
+        return d_pose
 
     def update(self, pose_lms, hol_rh, hol_lh, hand_detector, mp_image):
-        # 1. Si Holistic detectó ambas manos, confiar en ambas plenamente (evita 'ganar dominio')
-        if hol_rh and hol_lh:
-            self.prev_rh = hol_rh
-            self.prev_lh = hol_lh
-            self.rh_lost_frames = 0
-            self.lh_lost_frames = 0
-            return hol_rh, hol_lh
-
         curr_rh = hol_rh
         curr_lh = hol_lh
+        holistic_had_dup = False
 
-        # 2. Si falta alguna mano en Holistic, consultar HandLandmarker solo cuando sea necesario:
-        #    - Si no hay ninguna mano ni había manos recientes, Holistic ya escaneó el cuadro completo -> evitar doble inferencia (+22 ms)
-        #    - Si una mano acaba de perderse o hay posibilidad de seña bimanual (muñeca de Pose elevada o mano previa activa), activar rescate
+        # 1. Si Holistic detectó ambas manos, verificar que no estén superpuestas sobre la misma mano física
+        if curr_rh is not None and curr_lh is not None:
+            if self._is_same_hand(curr_rh, curr_lh):
+                holistic_had_dup = True
+                if self._hand_side_cost(curr_rh, 'rh', pose_lms) <= self._hand_side_cost(curr_lh, 'lh', pose_lms):
+                    curr_lh = None
+                else:
+                    curr_rh = None
+            else:
+                self.prev_rh = curr_rh
+                self.prev_lh = curr_lh
+                self.rh_lost_frames = 0
+                self.lh_lost_frames = 0
+                self.both_active_frames = min(self.both_active_frames + 1, 30)
+                return curr_rh, curr_lh
+
+        # 2. Si falta alguna mano en Holistic (y no fue una duplicación recién filtrada),
+        #    consultar HandLandmarker solo cuando sea necesario
         should_query_fallback = False
-        if (not curr_rh or not curr_lh) and hand_detector is not None:
+        if not holistic_had_dup and (curr_rh is None or curr_lh is None) and hand_detector is not None:
             if curr_rh is None and curr_lh is None:
                 # Ninguna mano en Holistic: solo rescatar si una mano se perdió hace pocos frames
                 if (self.prev_rh is not None and self.rh_lost_frames < 4) or (self.prev_lh is not None and self.lh_lost_frames < 4):
@@ -361,71 +450,92 @@ class RobustHandTracker:
             if hand_res and hand_res.hand_landmarks:
                 candidates = list(hand_res.hand_landmarks)
 
-                # Filtrar duplicados: un candidato solo es duplicado si coincide en todos los 21 puntos (< 0.045)
+                # Filtrar duplicados respecto a manos ya detectadas y entre candidatos del propio HandLandmarker
                 unique_cands = []
                 for cand in candidates:
-                    is_dup = False
-                    for existing in [curr_rh, curr_lh]:
-                        if existing is not None:
-                            mean_dist = np.mean([
-                                np.hypot(c.x - e.x, c.y - e.y)
-                                for c, e in zip(cand, existing)
-                            ])
-                            if mean_dist < 0.045:
-                                is_dup = True
-                                break
-                    if not is_dup:
-                        unique_cands.append(cand)
-
-                # Coordenadas de referencia de los brazos desde Pose
-                # En imagen original sin espejo: muñeca derecha = 16, muñeca izquierda = 15
-                pose_rw = (pose_lms[16].x, pose_lms[16].y) if (pose_lms and len(pose_lms) > 16) else (0.35, 0.70)
-                pose_lw = (pose_lms[15].x, pose_lms[15].y) if (pose_lms and len(pose_lms) > 15) else (0.65, 0.70)
+                    if self._is_same_hand(cand, curr_rh) or self._is_same_hand(cand, curr_lh):
+                        continue
+                    if any(self._is_same_hand(cand, prev_c) for prev_c in unique_cands):
+                        continue
+                    unique_cands.append(cand)
 
                 for cand in unique_cands:
-                    cw = (cand[0].x, cand[0].y)
-                    # Costo de asociar a Mano Derecha
-                    d_rw = np.hypot(cw[0] - pose_rw[0], cw[1] - pose_rw[1])
-                    if self.prev_rh is not None:
-                        d_rw = 0.45 * d_rw + 0.55 * np.hypot(cw[0] - self.prev_rh[0].x, cw[1] - self.prev_rh[0].y)
+                    d_rw = self._hand_side_cost(cand, 'rh', pose_lms)
+                    d_lw = self._hand_side_cost(cand, 'lh', pose_lms)
 
-                    # Costo de asociar a Mano Izquierda
-                    d_lw = np.hypot(cw[0] - pose_lw[0], cw[1] - pose_lw[1])
-                    if self.prev_lh is not None:
-                        d_lw = 0.45 * d_lw + 0.55 * np.hypot(cw[0] - self.prev_lh[0].x, cw[1] - self.prev_lh[0].y)
+                    if curr_rh is None and curr_lh is None:
+                        if d_rw <= d_lw:
+                            curr_rh = cand
+                        else:
+                            curr_lh = cand
+                    elif curr_rh is None:
+                        # Solo asignar a RH si no se superpone con LH y corresponde geométricamente al brazo derecho
+                        if not self._is_same_hand(cand, curr_lh):
+                            had_recent_rh = (self.prev_rh is not None and self.rh_lost_frames <= self.max_occlusion_coasting)
+                            if d_rw <= d_lw + 0.08 or had_recent_rh:
+                                curr_rh = cand
+                    elif curr_lh is None:
+                        # Solo asignar a LH si no se superpone con RH y corresponde geométricamente al brazo izquierdo
+                        if not self._is_same_hand(cand, curr_rh):
+                            had_recent_lh = (self.prev_lh is not None and self.lh_lost_frames <= self.max_occlusion_coasting)
+                            if d_lw <= d_rw + 0.08 or had_recent_lh:
+                                curr_lh = cand
 
-                    if curr_rh is None and (curr_lh is not None or d_rw <= d_lw):
-                        curr_rh = cand
-                    elif curr_lh is None and (curr_rh is not None or d_lw < d_rw):
-                        curr_lh = cand
+        # Actualizar contador de presencia bimanual genuina (antes de coasting)
+        if curr_rh is not None and curr_lh is not None and not self._is_same_hand(curr_rh, curr_lh):
+            self.both_active_frames = min(self.both_active_frames + 1, 30)
+        elif curr_rh is None and curr_lh is None:
+            self.both_active_frames = 0
+        else:
+            self.both_active_frames = max(0, self.both_active_frames - 1)
 
-        # 3. Persistencia por oclusión de contacto (cuando las dos manos se tocan o chocan)
+        # 3. Persistencia por oclusión de contacto (solo si había dos manos genuinas activas y sin superposición)
         if curr_rh is not None and curr_lh is None and self.prev_lh is not None:
-            # Si la mano izquierda estaba activa recientemente y las manos estaban cerca, mantenerla viva
             d_contact = np.hypot(curr_rh[0].x - self.prev_lh[0].x, curr_rh[0].y - self.prev_lh[0].y)
-            if d_contact < 0.16 and self.lh_lost_frames < self.max_occlusion_coasting:
+            if (self.both_active_frames >= 3
+                    and d_contact < 0.16
+                    and self.lh_lost_frames < self.max_occlusion_coasting
+                    and not self._is_same_hand(curr_rh, self.prev_lh)):
                 curr_lh = self.prev_lh
                 self.lh_lost_frames += 1
             else:
                 self.lh_lost_frames += 1
+                if self.lh_lost_frames > self.max_occlusion_coasting:
+                    self.prev_lh = None
         elif curr_lh is not None:
             self.prev_lh = curr_lh
             self.lh_lost_frames = 0
         else:
             self.lh_lost_frames += 1
+            if self.lh_lost_frames > self.max_occlusion_coasting:
+                self.prev_lh = None
 
         if curr_lh is not None and curr_rh is None and self.prev_rh is not None:
             d_contact = np.hypot(curr_lh[0].x - self.prev_rh[0].x, curr_lh[0].y - self.prev_rh[0].y)
-            if d_contact < 0.16 and self.rh_lost_frames < self.max_occlusion_coasting:
+            if (self.both_active_frames >= 3
+                    and d_contact < 0.16
+                    and self.rh_lost_frames < self.max_occlusion_coasting
+                    and not self._is_same_hand(curr_lh, self.prev_rh)):
                 curr_rh = self.prev_rh
                 self.rh_lost_frames += 1
             else:
                 self.rh_lost_frames += 1
+                if self.rh_lost_frames > self.max_occlusion_coasting:
+                    self.prev_rh = None
         elif curr_rh is not None:
             self.prev_rh = curr_rh
             self.rh_lost_frames = 0
         else:
             self.rh_lost_frames += 1
+            if self.rh_lost_frames > self.max_occlusion_coasting:
+                self.prev_rh = None
+
+        # 4. Invariante final: nunca devolver dos grafos superpuestos sobre una sola mano física
+        if curr_rh is not None and curr_lh is not None and self._is_same_hand(curr_rh, curr_lh):
+            if self._hand_side_cost(curr_rh, 'rh', pose_lms) <= self._hand_side_cost(curr_lh, 'lh', pose_lms):
+                curr_lh = None
+            else:
+                curr_rh = None
 
         return curr_rh, curr_lh
 
@@ -1109,8 +1219,8 @@ def main():
             base_options=python.BaseOptions(model_asset_path=HAND_TASK_PATH),
             running_mode=vision.RunningMode.IMAGE,
             num_hands=2,
-            min_hand_detection_confidence=0.30,  # Alta sensibilidad para no perder manos contra el torso
-            min_hand_presence_confidence=0.30
+            min_hand_detection_confidence=0.45,
+            min_hand_presence_confidence=0.40
         )
 
     cap, active_cam = open_webcam(args.camera)

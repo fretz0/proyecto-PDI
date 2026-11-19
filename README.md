@@ -4,7 +4,7 @@ Sistema híbrido de visión por computador y aprendizaje profundo para el recono
 
 ## Video de demostración
 
-- [Demostración del sistema en Google Drive](https://drive.google.com/file/d/1eVWueIFO9i3UL1kuoAqHCHu4M0GUljVG/view?usp=sharing)
+- [Demostración del sistema en Google Drive](https://drive.google.com/file/d/1cC06mUSc6E8ZLerGYZ4tfH9DrdcKLBam/view?usp=sharing)
 
 ---
 
