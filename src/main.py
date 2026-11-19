@@ -1171,6 +1171,49 @@ def draw_ui(frame, top_preds, sentence, fps, has_pose, has_rh, has_lh,
                    (16, h - 18), size=12, color=(150, 160, 180), bold=False)
 
 
+TARGET_FRAME_W = 640
+TARGET_FRAME_H = 480
+
+
+def standardize_frame(frame, target_w=TARGET_FRAME_W, target_h=TARGET_FRAME_H):
+    """
+    Estandariza cualquier frame de entrada (webcam, celular 16:9 o vertical 9:16) a 640x480 (4:3)
+    sin deformar la imagen:
+    - Si ya es 640x480: retorna sin costo adicional.
+    - Si es más ancho que 4:3 (ej. 1280x720 / 1920x1080): recorte centrado horizontal y resize.
+    - Si es más alto/vertical que 4:3 (ej. 720x1280): ajusta al alto y agrega padding lateral
+      (pillarbox) para no recortar cabeza ni manos.
+    """
+    h, w = frame.shape[:2]
+    if w == target_w and h == target_h:
+        return frame
+
+    target_ratio = target_w / float(target_h)
+    curr_ratio = w / float(h)
+
+    if curr_ratio > target_ratio + 0.01:
+        # Más ancho que 4:3 (ej. 16:9 horizontal) -> recorte centrado a 4:3
+        new_w = max(1, int(round(h * target_ratio)))
+        x0 = (w - new_w) // 2
+        cropped = frame[:, x0:x0 + new_w]
+        interp = cv.INTER_AREA if new_w > target_w else cv.INTER_LINEAR
+        return cv.resize(cropped, (target_w, target_h), interpolation=interp)
+
+    if curr_ratio < target_ratio - 0.01:
+        # Más alto que 4:3 (ej. celular en vertical) -> ajustar alto y agregar bandas laterales
+        scale = target_h / float(h)
+        resized_w = max(1, min(target_w, int(round(w * scale))))
+        interp = cv.INTER_AREA if h > target_h else cv.INTER_LINEAR
+        resized = cv.resize(frame, (resized_w, target_h), interpolation=interp)
+        canvas = np.zeros((target_h, target_w, 3), dtype=frame.dtype)
+        x0 = (target_w - resized_w) // 2
+        canvas[:, x0:x0 + resized_w] = resized
+        return canvas
+
+    interp = cv.INTER_AREA if w > target_w else cv.INTER_LINEAR
+    return cv.resize(frame, (target_w, target_h), interpolation=interp)
+
+
 def open_webcam(preferred_idx=0):
     """Busca y abre la cámara especificada o la primera disponible, optimizada para Windows (CAP_DSHOW) y Linux."""
     candidates = [preferred_idx, 0, 1, 2]
@@ -1183,14 +1226,18 @@ def open_webcam(preferred_idx=0):
         for backend in backends:
             cap = cv.VideoCapture(idx, backend) if backend != cv.CAP_ANY else cv.VideoCapture(idx)
             if cap.isOpened():
-                cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv.CAP_PROP_FRAME_WIDTH, TARGET_FRAME_W)
+                cap.set(cv.CAP_PROP_FRAME_HEIGHT, TARGET_FRAME_H)
                 cap.set(cv.CAP_PROP_FPS, 30)
                 cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
-                ret, _ = cap.read()
-                if ret:
+                ret, test_frame = cap.read()
+                if ret and test_frame is not None:
+                    h_orig, w_orig = test_frame.shape[:2]
                     backend_name = "DirectShow" if backend == cv.CAP_DSHOW else "Default"
-                    print(f"[OK] Cámara web conectada en índice {idx} (backend: {backend_name})")
+                    std_note = ""
+                    if (w_orig, h_orig) != (TARGET_FRAME_W, TARGET_FRAME_H):
+                        std_note = f" -> estandarizado a {TARGET_FRAME_W}x{TARGET_FRAME_H}"
+                    print(f"[OK] Cámara conectada en índice {idx} (backend: {backend_name}, nativa: {w_orig}x{h_orig}{std_note})")
                     return cap, idx
                 cap.release()
     return None, None
@@ -1270,9 +1317,11 @@ def main():
         try:
             while cap.isOpened():
                 ret, raw_frame = cap.read()
-                if not ret:
+                if not ret or raw_frame is None:
                     print("[AVISO] Flujo de video finalizado.")
                     break
+
+                raw_frame = standardize_frame(raw_frame)
 
                 now_ms = int(time.monotonic() * 1000) - start_time_ms
                 if now_ms <= last_ts_ms:
